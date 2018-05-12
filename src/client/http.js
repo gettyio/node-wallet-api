@@ -5,8 +5,11 @@ const {Block, Transaction, Account} = require("../protocol/core/Tron_pb");
 const {AccountList, NumberMessage, WitnessList, AssetIssueList} = require("../protocol/api/api_pb");
 const {TransferContract} = require("../protocol/core/Contract_pb");
 const qs = require("qs");
+const buildApplyForDelegate = require("../utils/transaction").buildApplyForDelegate;
+const longToByteArray = require("../utils/bytes").longToByteArray;
+const hexStr2byteArray = require("../lib/code").hexStr2byteArray;
 const stringToBytes = require("../lib/code").stringToBytes;
-const { getBase58CheckAddress, signTransaction, passwordToAddress } = require("../utils/crypto");
+const { getBase58CheckAddress, signTransaction, privateKeyToAddress, SHA256 } = require("../utils/crypto");
 
 const ONE_TRX = 1000000;
 
@@ -39,6 +42,7 @@ class HttpClient {
     return {
       number: block.getBlockHeader().getRawData().getNumber(),
       witnessId: block.getBlockHeader().getRawData().getWitnessId(),
+      hash: byteArray2hexStr(SHA256(block.getBlockHeader().serializeBinary())),
       parentHash: byteArray2hexStr(block.getBlockHeader().getRawData().getParenthash()),
     };
   }
@@ -191,7 +195,24 @@ class HttpClient {
       })
     }
 
-    return balances;
+    let frozenBalances = accountInfo.getFrozenList().map(frozenBalance => ({
+      amount: frozenBalance.getFrozenBalance(),
+      expires: frozenBalance.getExpireTime(),
+    }));
+
+    let totalFrozenBalance = 0;
+
+    for (let frozenBalance of frozenBalances) {
+      totalFrozenBalance += frozenBalance.amount;
+    }
+
+    return {
+      balances,
+      frozen: {
+        total: totalFrozenBalance,
+        balances: frozenBalances,
+      }
+    };
   }
 
   /**
@@ -203,7 +224,7 @@ class HttpClient {
    */
   async voteForWitnesses(password, votes) {
     let {data} = await xhr.post(`${this.url}/createVoteWitnessToView`, {
-      owner: passwordToAddress(password),
+      owner: privateKeyToAddress(password),
       list: votes,
     });
 
@@ -219,19 +240,47 @@ class HttpClient {
    * @returns {Promise<void>}
    */
   async applyForDelegate(password, url) {
-    let {data} = await xhr
-      .post(`${this.url}/createWitnessToView`, qs.stringify({
-        address: passwordToAddress(password),
-        onwerUrl: url, // TODO yes this is spelled wrong :(
-      }));
-
-    return await this.signTransaction(password, data);
+    let transaction = buildApplyForDelegate(privateKeyToAddress(password), url);
+    return await this.signTransaction(password, transaction);
   }
 
-  async signTransaction(password, data) {
-    let bytesDecode = base64DecodeFromString(data);
-    let transaction = Transaction.deserializeBinary(bytesDecode);
-    let transactionSigned = signTransaction(base64DecodeFromString(password), transaction);
+  /**
+   * Add reference to transaction
+   */
+  async addRef(transaction) {
+
+    let latestBlock = await this.getLatestBlock();
+
+    let latestBlockHash = latestBlock.hash;
+    let latestBlockNum = latestBlock.number;
+
+    let numBytes = longToByteArray(latestBlockNum);
+    numBytes.reverse();
+    let hashBytes = hexStr2byteArray(latestBlockHash);
+
+    let generateBlockId = [...numBytes.slice(0, 8), ...hashBytes.slice(8, hashBytes.length - 1)];
+
+    let rawData = transaction.getRawData();
+    rawData.setRefBlockHash(Uint8Array.from(generateBlockId.slice(8, 16)));
+    rawData.setRefBlockBytes(Uint8Array.from(numBytes.slice(6, 8)));
+
+    transaction.setRawData(rawData);
+    return transaction;
+  }
+
+  async signTransaction(privateKey, data) {
+
+    let transaction;
+    if (typeof data === 'string') {
+      let bytesDecode = base64DecodeFromString(data);
+      transaction = Transaction.deserializeBinary(bytesDecode);
+    } else if (data instanceof Transaction) {
+      transaction = data;
+    }
+
+    transaction = await this.addRef(transaction);
+
+    let transactionSigned = signTransaction(hexStr2byteArray(privateKey), transaction);
     let transactionBytes = transactionSigned.serializeBinary();
     let transactionString = byteArray2hexStr(transactionBytes);
 
@@ -255,7 +304,7 @@ class HttpClient {
 
     if (token.toUpperCase() === 'TRX') {
       let {data} = await xhr.post(`${this.url}/sendCoinToView`, qs.stringify({
-        Address: passwordToAddress(password),
+        Address: privateKeyToAddress(password),
         toAddress: to,
         Amount: amount
       }));
@@ -264,9 +313,9 @@ class HttpClient {
     } else {
       let {data} = await xhr.post(`${this.url}/TransferAssetToView`, qs.stringify({
         assetName: token,
-        Address: passwordToAddress(password),
+        Address: privateKeyToAddress(password),
         toAddress: to,
-        Amount: amount,
+        Amount: amount / ONE_TRX,
       }));
 
       return await this.signTransaction(password, data);
@@ -288,7 +337,7 @@ class HttpClient {
         endTime: Date.parse(config.endTime),
         description: config.description,
         url: config.url,
-        ownerAddress: passwordToAddress(password),
+        ownerAddress: privateKeyToAddress(password),
       }));
 
     return await this.signTransaction(password, data);
@@ -297,9 +346,9 @@ class HttpClient {
   async participateAsset(password, config) {
     let {data} = await xhr.post(`${this.url}/ParticipateAssetIssueToView`, qs.stringify({
       name: byteArray2hexStr(stringToBytes(config.name)),
-      ownerAddress: passwordToAddress(password),
+      ownerAddress: privateKeyToAddress(password),
       toAddress: config.issuerAddress,
-      amount: config.name.toUpperCase() === 'TRX' ? config.amount : (config.amount / ONE_TRX),
+      amount: config.amount,
     }));
 
     return await this.signTransaction(password, data);
